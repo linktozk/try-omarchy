@@ -1196,6 +1196,16 @@ def main() -> None:
     manifest_writer = read(GUEST / "scripts/write-guest-manifest.py")
     check('"kind": "try-omarchy-guest-artifacts"' in manifest_writer, "new artifacts use the native manifest identity")
 
+    scroll_check = GUEST / "native-overlay/usr/local/bin/try-omarchy-scroll-check"
+    check(scroll_check.stat().st_mode & stat.S_IXUSR != 0, "high-resolution wheel validator is executable")
+    with tempfile.TemporaryDirectory() as temporary:
+        py_compile.compile(str(scroll_check), cfile=str(Path(temporary) / "scroll-check.pyc"), doraise=True)
+    check(True, "high-resolution wheel validator compiles")
+    check(
+        '\n  "$root/usr/local/bin/try-omarchy-scroll-check" \\\n' in configure,
+        "rootfs installs the high-resolution wheel validator as executable",
+    )
+
     audio_bridge = GUEST / "native-overlay/usr/local/bin/omarchy-native-audio-bridge"
     check(audio_bridge.stat().st_mode & stat.S_IXUSR != 0, "native audio bridge is executable")
     with tempfile.TemporaryDirectory() as temporary:

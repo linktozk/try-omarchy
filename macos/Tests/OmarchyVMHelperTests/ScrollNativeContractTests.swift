@@ -37,4 +37,19 @@ struct ScrollNativeContractTests {
         #expect(builder.contains("qemu-virtio-scroll-devices.patch"))
         #expect(builder.contains("qemu-cocoa-scroll-routing.patch"))
     }
+
+    @Test("High-resolution wheel preserves Cocoa's host-selected direction")
+    func highResolutionWheelDirectionContract() throws {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let patch = try String(
+            contentsOf: root.appendingPathComponent("patches/qemu-virtio-scroll-devices.patch"),
+            encoding: .utf8
+        )
+
+        #expect(patch.contains("double units = points * HIRES_WHEEL_UNITS_PER_POINT + *fraction;"))
+        #expect(!patch.contains("double units = -points * HIRES_WHEEL_UNITS_PER_POINT + *fraction;"))
+    }
 }

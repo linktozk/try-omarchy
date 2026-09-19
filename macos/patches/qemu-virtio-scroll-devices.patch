@@ -302,7 +302,7 @@ index 0000000..78cb6e5
 +
 +static int hires_wheel_value(double points, double *fraction)
 +{
-+    double units = -points * HIRES_WHEEL_UNITS_PER_POINT + *fraction;
++    double units = points * HIRES_WHEEL_UNITS_PER_POINT + *fraction;
 +    int value = trunc(units);
 +
 +    *fraction = units - value;
