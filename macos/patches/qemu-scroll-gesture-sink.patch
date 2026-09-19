@@ -1,0 +1,121 @@
+From: Try Omarchy contributors
+Subject: [PATCH] ui: add explicit scroll gesture sink interface
+
+Define a narrow semantic interface between host display backends and dedicated
+virtual scroll devices. The contract carries deltas, lifecycle phases and a
+timestamp without coupling Cocoa to a particular guest input implementation.
+
+diff --git a/include/ui/scroll-gesture.h b/include/ui/scroll-gesture.h
+new file mode 100644
+index 0000000..5535ede
+--- /dev/null
++++ b/include/ui/scroll-gesture.h
+@@ -0,0 +1,51 @@
++/*
++ * Semantic scroll gesture interface.
++ *
++ * Copyright (c) 2026 Try Omarchy contributors
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#ifndef QEMU_UI_SCROLL_GESTURE_H
++#define QEMU_UI_SCROLL_GESTURE_H
++
++#include "qom/object.h"
++
++#define TYPE_SCROLL_GESTURE_SINK "scroll-gesture-sink"
++
++typedef struct ScrollGestureSink ScrollGestureSink;
++typedef struct ScrollGestureSinkClass ScrollGestureSinkClass;
++
++DECLARE_CLASS_CHECKERS(ScrollGestureSinkClass, SCROLL_GESTURE_SINK,
++                       TYPE_SCROLL_GESTURE_SINK)
++#define SCROLL_GESTURE_SINK(obj) \
++    INTERFACE_CHECK(ScrollGestureSink, (obj), TYPE_SCROLL_GESTURE_SINK)
++
++typedef enum ScrollGesturePhase {
++    SCROLL_GESTURE_PHASE_NONE,
++    SCROLL_GESTURE_PHASE_BEGIN,
++    SCROLL_GESTURE_PHASE_UPDATE,
++    SCROLL_GESTURE_PHASE_END,
++    SCROLL_GESTURE_PHASE_CANCEL,
++} ScrollGesturePhase;
++
++typedef struct ScrollGestureSample {
++    double dx;
++    double dy;
++    int64_t timestamp_ns;
++    ScrollGesturePhase phase;
++    ScrollGesturePhase momentum_phase;
++    bool precise;
++} ScrollGestureSample;
++
++struct ScrollGestureSinkClass {
++    InterfaceClass parent;
++
++    void (*send)(ScrollGestureSink *sink,
++                 const ScrollGestureSample *sample);
++    void (*reset)(ScrollGestureSink *sink, bool running);
++};
++
++void scroll_gesture_sink_send(ScrollGestureSink *sink,
++                              const ScrollGestureSample *sample);
++void scroll_gesture_sink_reset(ScrollGestureSink *sink, bool running);
++
++#endif /* QEMU_UI_SCROLL_GESTURE_H */
+diff --git a/ui/meson.build b/ui/meson.build
+index 953ba0f..8d1c118 100644
+--- a/ui/meson.build
++++ b/ui/meson.build
+@@ -56,6 +56,7 @@ system_ss.add(png)
+ system_ss.add(files(
+   'input-barrier.c',
+   'input.c',
++  'scroll-gesture.c',
+   'ui-hmp-cmds.c',
+   'ui-qmp-cmds.c',
+   'util.c',
+diff --git a/ui/scroll-gesture.c b/ui/scroll-gesture.c
+new file mode 100644
+index 0000000..547466e
+--- /dev/null
++++ b/ui/scroll-gesture.c
+@@ -0,0 +1,39 @@
++/*
++ * Semantic scroll gesture interface.
++ *
++ * Copyright (c) 2026 Try Omarchy contributors
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include "qemu/module.h"
++#include "ui/scroll-gesture.h"
++
++void scroll_gesture_sink_send(ScrollGestureSink *sink,
++                              const ScrollGestureSample *sample)
++{
++    ScrollGestureSinkClass *klass = SCROLL_GESTURE_SINK_GET_CLASS(sink);
++
++    klass->send(sink, sample);
++}
++
++void scroll_gesture_sink_reset(ScrollGestureSink *sink, bool running)
++{
++    ScrollGestureSinkClass *klass = SCROLL_GESTURE_SINK_GET_CLASS(sink);
++
++    if (klass->reset) {
++        klass->reset(sink, running);
++    }
++}
++
++static const TypeInfo scroll_gesture_sink_info = {
++    .name = TYPE_SCROLL_GESTURE_SINK,
++    .parent = TYPE_INTERFACE,
++    .class_size = sizeof(ScrollGestureSinkClass),
++};
++
++static void scroll_gesture_sink_register_types(void)
++{
++    type_register_static(&scroll_gesture_sink_info);
++}
++
++type_init(scroll_gesture_sink_register_types)

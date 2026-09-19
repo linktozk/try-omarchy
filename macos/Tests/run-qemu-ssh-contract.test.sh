@@ -89,7 +89,8 @@ case " $* " in
     for device in \
       hda-micro intel-hda virtconsole virtserialport virtio-balloon-pci \
       virtio-9p-pci virtio-blk-pci virtio-gpu-gl-pci virtio-keyboard-pci \
-      virtio-net-pci virtio-rng-pci virtio-serial-pci virtio-tablet-pci virtio-pinch-pci; do
+      virtio-net-pci virtio-rng-pci virtio-serial-pci virtio-tablet-pci virtio-pinch-pci \
+      virtio-scroll-touchpad-pci virtio-hires-wheel-pci; do
       printf 'name "%s"\n' "$device"
     done
     ;;

@@ -55,6 +55,7 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
     private let portForwardingStore: PortForwardingPreferenceStore
     private let networkStore: VMNetworkPreferenceStore
     private let fullscreenPreferenceStore: FullscreenPreferenceStore
+    private let scrollPreferenceStore: ScrollPreferenceStore
     private let resourcePreferenceStore: VMResourcePreferenceStore
     private let resourceLimits: VMResourceLimits
     private let storageLocationStore: StorageLocationPreferenceStore
@@ -96,6 +97,7 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
         portForwardingStore: PortForwardingPreferenceStore = PortForwardingPreferenceStore(),
         networkStore: VMNetworkPreferenceStore = VMNetworkPreferenceStore(),
         fullscreenPreferenceStore: FullscreenPreferenceStore = FullscreenPreferenceStore(),
+        scrollPreferenceStore: ScrollPreferenceStore = ScrollPreferenceStore(),
         resourcePreferenceStore: VMResourcePreferenceStore = VMResourcePreferenceStore(),
         resourceLimits: VMResourceLimits = .current,
         storageLocationStore: StorageLocationPreferenceStore = StorageLocationPreferenceStore(),
@@ -113,6 +115,7 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
         self.portForwardingStore = portForwardingStore
         self.networkStore = networkStore
         self.fullscreenPreferenceStore = fullscreenPreferenceStore
+        self.scrollPreferenceStore = scrollPreferenceStore
         self.resourcePreferenceStore = resourcePreferenceStore
         self.resourceLimits = resourceLimits
         self.storageLocationStore = storageLocationStore
@@ -225,6 +228,12 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
                 self?.fullscreenPreferenceStore.save(
                     FullscreenPreferences(isImmersive: isImmersive)
                 )
+            },
+            scrollMode: { [weak self] in
+                self?.scrollPreferenceStore.load().mode ?? .automatic
+            },
+            setScrollMode: { [weak self] mode in
+                self?.scrollPreferenceStore.save(ScrollPreferences(mode: mode))
             },
             launch: { [weak self] in
                 self?.startVirtualMachine()
@@ -445,8 +454,12 @@ final class VMApplicationController: NSObject, NSApplicationDelegate {
             baseEnvironment: forwarding.environment,
             preferences: fullscreenPreferenceStore.load()
         )
-        let resources = VMResourceLaunchConfiguration.make(
+        let scrolling = ScrollLaunchConfiguration.make(
             baseEnvironment: fullscreen.environment,
+            preferences: scrollPreferenceStore.load()
+        )
+        let resources = VMResourceLaunchConfiguration.make(
+            baseEnvironment: scrolling.environment,
             preferences: resourcePreferenceStore.load(),
             limits: resourceLimits
         )

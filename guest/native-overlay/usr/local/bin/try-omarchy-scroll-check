@@ -1,0 +1,424 @@
+#!/usr/bin/python3
+"""Validate Try Omarchy's native high-resolution wheel from inside the guest."""
+
+from __future__ import annotations
+
+import argparse
+from dataclasses import asdict, dataclass
+import json
+import os
+from pathlib import Path
+import select
+import statistics
+import struct
+import sys
+import time
+from typing import Iterable
+
+
+DEVICE_NAME = "QEMU Virtio High Resolution Wheel"
+SYS_INPUT = Path("/sys/class/input")
+
+EV_SYN = 0x00
+EV_REL = 0x02
+SYN_REPORT = 0x00
+SYN_DROPPED = 0x03
+REL_HWHEEL = 0x06
+REL_WHEEL = 0x08
+REL_WHEEL_HI_RES = 0x0B
+REL_HWHEEL_HI_RES = 0x0C
+UNITS_PER_DETENT = 120
+
+# Try Omarchy ships only an aarch64 guest.  Native long is therefore 64 bit,
+# matching Linux's struct timeval in struct input_event (24 bytes total).
+INPUT_EVENT = struct.Struct("@llHHi")
+
+
+@dataclass(frozen=True)
+class InputDevice:
+    event_path: Path
+    sys_path: Path
+    name: str
+    rel_mask: int
+
+    def supports(self, code: int) -> bool:
+        return bool(self.rel_mask & (1 << code))
+
+
+@dataclass(frozen=True)
+class ScrollFrame:
+    timestamp: float
+    vertical_hires: int = 0
+    horizontal_hires: int = 0
+    vertical_legacy: int = 0
+    horizontal_legacy: int = 0
+
+
+@dataclass(frozen=True)
+class Check:
+    key: str
+    passed: bool
+    detail: str
+
+
+def parse_capability_mask(text: str) -> int:
+    """Parse Linux sysfs' high-to-low, whitespace-separated hex bitmap."""
+    compact = "".join(text.split())
+    return int(compact, 16) if compact else 0
+
+
+def discover_devices(sys_input: Path = SYS_INPUT) -> list[InputDevice]:
+    devices: list[InputDevice] = []
+    for sys_path in sorted(sys_input.glob("event*")):
+        try:
+            name = (sys_path / "device/name").read_text(encoding="utf-8").strip()
+            rel_mask = parse_capability_mask(
+                (sys_path / "device/capabilities/rel").read_text(encoding="ascii")
+            )
+        except (FileNotFoundError, OSError, ValueError):
+            continue
+        if name == DEVICE_NAME:
+            devices.append(
+                InputDevice(
+                    event_path=Path("/dev/input") / sys_path.name,
+                    sys_path=sys_path,
+                    name=name,
+                    rel_mask=rel_mask,
+                )
+            )
+    return devices
+
+
+def capability_checks(device: InputDevice) -> list[Check]:
+    required = (
+        (REL_WHEEL_HI_RES, "REL_WHEEL_HI_RES"),
+        (REL_HWHEEL_HI_RES, "REL_HWHEEL_HI_RES"),
+        (REL_WHEEL, "REL_WHEEL"),
+        (REL_HWHEEL, "REL_HWHEEL"),
+    )
+    return [
+        Check(
+            key=f"capability_{name.lower()}",
+            passed=device.supports(code),
+            detail=f"{name} {'present' if device.supports(code) else 'missing'}",
+        )
+        for code, name in required
+    ]
+
+
+def _percentile(values: list[float], percent: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = min(len(ordered) - 1, max(0, round((len(ordered) - 1) * percent)))
+    return ordered[index]
+
+
+def analyze_frames(
+    frames: Iterable[ScrollFrame],
+    *,
+    dropped: int = 0,
+    expected_sign: int | None = -1,
+) -> dict[str, object]:
+    samples = [frame for frame in frames if frame.vertical_hires]
+    values = [frame.vertical_hires for frame in samples]
+    legacy = [frame.vertical_legacy for frame in samples if frame.vertical_legacy]
+    absolute = [abs(value) for value in values]
+    gaps_ms = [
+        (right.timestamp - left.timestamp) * 1000
+        for left, right in zip(samples, samples[1:])
+        if right.timestamp >= left.timestamp
+    ]
+    positive = sum(value > 0 for value in values)
+    negative = sum(value < 0 for value in values)
+    dominant = max(positive, negative) / len(values) if values else 0.0
+    total_hires = sum(values)
+    total_legacy = sum(legacy)
+    fine_ratio = (
+        sum(value < UNITS_PER_DETENT for value in absolute) / len(absolute)
+        if absolute
+        else 0.0
+    )
+    non_detent_ratio = (
+        sum(value % UNITS_PER_DETENT != 0 for value in absolute) / len(absolute)
+        if absolute
+        else 0.0
+    )
+    direction_ok = (
+        True
+        if expected_sign is None
+        else bool(total_hires) and (1 if total_hires > 0 else -1) == expected_sign
+    )
+    legacy_error_detents = (
+        abs(total_legacy - total_hires / UNITS_PER_DETENT)
+        if total_hires
+        else float("inf")
+    )
+
+    p50_gap = _percentile(gaps_ms, 0.50)
+    p95_gap = _percentile(gaps_ms, 0.95)
+    median_magnitude = statistics.median(absolute) if absolute else None
+    checks = [
+        Check(
+            "sample_count",
+            len(values) >= 12,
+            f"{len(values)} non-zero high-resolution frames (target >= 12)",
+        ),
+        Check(
+            "fine_granularity",
+            len(values) >= 4 and fine_ratio >= 0.80 and non_detent_ratio >= 0.80,
+            f"{fine_ratio:.0%} below one detent; {non_detent_ratio:.0%} are not 120-unit steps",
+        ),
+        Check(
+            "cadence",
+            p50_gap is not None and p50_gap <= 35 and (p95_gap or 0) <= 100,
+            (
+                f"frame gap p50={p50_gap:.1f} ms, p95={p95_gap:.1f} ms"
+                if p50_gap is not None and p95_gap is not None
+                else "not enough frames to measure cadence"
+            ),
+        ),
+        Check(
+            "stable_direction",
+            len(values) >= 4 and dominant >= 0.90,
+            f"{dominant:.0%} of frames share one direction",
+        ),
+        Check(
+            "host_direction",
+            direction_ok,
+            (
+                "direction check skipped"
+                if expected_sign is None
+                else f"observed net sign {'positive' if total_hires > 0 else 'negative' if total_hires < 0 else 'zero'}; expected {'positive' if expected_sign > 0 else 'negative'}"
+            ),
+        ),
+        Check(
+            "legacy_compatibility",
+            len(values) >= 4 and legacy_error_detents <= 1.25,
+            f"hi-res total={total_hires}, legacy total={total_legacy}, boundary error={legacy_error_detents:.2f} detents",
+        ),
+        Check(
+            "no_kernel_drop",
+            dropped == 0,
+            f"{dropped} SYN_DROPPED notifications",
+        ),
+    ]
+
+    weights = {
+        "sample_count": 15,
+        "fine_granularity": 25,
+        "cadence": 15,
+        "stable_direction": 15,
+        "host_direction": 20,
+        "legacy_compatibility": 5,
+        "no_kernel_drop": 5,
+    }
+    score = sum(weights[check.key] for check in checks if check.passed)
+    critical = {"fine_granularity", "host_direction", "no_kernel_drop"}
+    critical_ok = all(check.passed for check in checks if check.key in critical)
+    if score >= 85 and critical_ok:
+        status = "pass"
+        grade = "excellent" if score >= 95 else "good"
+    elif score >= 60 and critical_ok:
+        status = "warn"
+        grade = "usable"
+    else:
+        status = "fail"
+        grade = "needs-improvement"
+
+    return {
+        "status": status,
+        "grade": grade,
+        "score": score,
+        "sample_count": len(values),
+        "total_hires": total_hires,
+        "total_legacy": total_legacy,
+        "median_magnitude": median_magnitude,
+        "p50_gap_ms": p50_gap,
+        "p95_gap_ms": p95_gap,
+        "checks": [asdict(check) for check in checks],
+    }
+
+
+def capture_frames(fd: int, duration: float) -> tuple[list[ScrollFrame], int]:
+    deadline = time.monotonic() + duration
+    pending: dict[int, int] = {}
+    frames: list[ScrollFrame] = []
+    dropped = 0
+    buffer = b""
+
+    while time.monotonic() < deadline:
+        timeout = max(0.0, min(0.25, deadline - time.monotonic()))
+        readable, _, _ = select.select([fd], [], [], timeout)
+        if not readable:
+            continue
+        try:
+            chunk = os.read(fd, INPUT_EVENT.size * 64)
+        except BlockingIOError:
+            continue
+        if not chunk:
+            break
+        buffer += chunk
+        while len(buffer) >= INPUT_EVENT.size:
+            raw, buffer = buffer[: INPUT_EVENT.size], buffer[INPUT_EVENT.size :]
+            seconds, microseconds, event_type, code, value = INPUT_EVENT.unpack(raw)
+            if event_type == EV_REL and code in {
+                REL_WHEEL_HI_RES,
+                REL_HWHEEL_HI_RES,
+                REL_WHEEL,
+                REL_HWHEEL,
+            }:
+                pending[code] = pending.get(code, 0) + value
+            elif event_type == EV_SYN and code == SYN_DROPPED:
+                dropped += 1
+                pending.clear()
+            elif event_type == EV_SYN and code == SYN_REPORT:
+                if pending:
+                    frames.append(
+                        ScrollFrame(
+                            timestamp=seconds + microseconds / 1_000_000,
+                            vertical_hires=pending.get(REL_WHEEL_HI_RES, 0),
+                            horizontal_hires=pending.get(REL_HWHEEL_HI_RES, 0),
+                            vertical_legacy=pending.get(REL_WHEEL, 0),
+                            horizontal_legacy=pending.get(REL_HWHEEL, 0),
+                        )
+                    )
+                pending.clear()
+    return frames, dropped
+
+
+def drain(fd: int) -> None:
+    while True:
+        readable, _, _ = select.select([fd], [], [], 0)
+        if not readable:
+            return
+        try:
+            if not os.read(fd, INPUT_EVENT.size * 64):
+                return
+        except BlockingIOError:
+            return
+
+
+def _open_device(path: Path) -> int:
+    try:
+        return os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except PermissionError as error:
+        raise PermissionError(
+            f"无法读取 {path}。请使用 sudo try-omarchy-scroll-check 运行。"
+        ) from error
+
+
+def _expected_sign(value: str) -> int | None:
+    return {"negative": -1, "positive": 1, "ignore": None}[value]
+
+
+def _print_human(device: InputDevice, capabilities: list[Check], result: dict[str, object]) -> None:
+    print(f"\n设备: {device.name} ({device.event_path})")
+    print("设备能力:")
+    for check in capabilities:
+        print(f"  {'PASS' if check.passed else 'FAIL'}  {check.detail}")
+    print(f"\n事件层体验评分: {result['score']}/100  {str(result['grade']).upper()}")
+    for check in result["checks"]:
+        marker = "PASS" if check["passed"] else "FAIL"
+        print(f"  {marker}  {check['key']}: {check['detail']}")
+    print("\n说明: 该评分验证设备能力、粒度、采样节奏、抖动、方向与兼容刻度；")
+    print("      页面动画仍受 Wayland 合成器和应用自身滚动实现影响，需另做主观验收。")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="检测并采样 Try Omarchy 高精度虚拟滚轮设备。"
+    )
+    parser.add_argument("--duration", type=float, default=6.0, help="采样秒数，默认 6")
+    parser.add_argument("--device", type=Path, help="指定 /dev/input/eventN")
+    parser.add_argument(
+        "--expected-sign",
+        choices=("negative", "positive", "ignore"),
+        default="negative",
+        help="手指向上单向滑动的期望符号；macOS 自然滚动默认 negative",
+    )
+    parser.add_argument("--no-prompt", action="store_true", help="不等待 Enter，立即采样")
+    parser.add_argument("--json", action="store_true", help="输出机器可读 JSON")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    if args.duration <= 0:
+        print("error: --duration 必须大于 0", file=sys.stderr)
+        return 2
+    if INPUT_EVENT.size != 24:
+        print(f"error: 不支持的 struct input_event 大小: {INPUT_EVENT.size}", file=sys.stderr)
+        return 2
+
+    devices = discover_devices()
+    if args.device:
+        devices = [device for device in devices if device.event_path == args.device]
+    if not devices:
+        print(
+            f"FAIL: 未发现 {DEVICE_NAME!r}。请确认虚拟机以独立高精度滚轮设备启动。",
+            file=sys.stderr,
+        )
+        return 1
+    if len(devices) > 1:
+        print("FAIL: 发现多个同名设备，请用 --device 指定。", file=sys.stderr)
+        return 1
+
+    device = devices[0]
+    capabilities = capability_checks(device)
+    if not all(check.passed for check in capabilities):
+        payload = {
+            "status": "fail",
+            "device": str(device.event_path),
+            "capabilities": [asdict(check) for check in capabilities],
+        }
+        print(json.dumps(payload, ensure_ascii=False, indent=2) if args.json else payload)
+        return 1
+
+    try:
+        fd = _open_device(device.event_path)
+    except (PermissionError, OSError) as error:
+        print(f"FAIL: {error}", file=sys.stderr)
+        return 2
+
+    try:
+        drain(fd)
+        if not args.no_prompt:
+            print(f"已发现 {device.name}: {device.event_path}")
+            print("接下来只做一次连续手势：两指从触控板下方向上方滑动，不要来回。")
+            input("准备好后按 Enter 开始采样… ")
+            for remaining in (3, 2, 1):
+                print(f"{remaining}…", flush=True)
+                time.sleep(1)
+            drain(fd)
+            print(f"开始，采样 {args.duration:g} 秒。", flush=True)
+        frames, dropped = capture_frames(fd, args.duration)
+    except KeyboardInterrupt:
+        print("\n已取消。", file=sys.stderr)
+        return 130
+    finally:
+        os.close(fd)
+
+    result = analyze_frames(
+        frames,
+        dropped=dropped,
+        expected_sign=_expected_sign(args.expected_sign),
+    )
+    payload = {
+        "device": {
+            "name": device.name,
+            "event_path": str(device.event_path),
+            "rel_mask": f"0x{device.rel_mask:x}",
+        },
+        "capabilities": [asdict(check) for check in capabilities],
+        "result": result,
+    }
+    if args.json:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        _print_human(device, capabilities, result)
+    return 0 if result["status"] == "pass" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

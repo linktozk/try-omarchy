@@ -1,0 +1,665 @@
+From: Try Omarchy contributors
+Subject: [PATCH] virtio-input: add dedicated native scroll devices
+
+Add a gesture-only indirect touchpad and a high-resolution wheel as standard
+virtio-input PCI devices. The touchpad exposes two contacts so the guest input
+stack owns scrolling and inertia; the wheel exposes Linux high-resolution axes
+plus accumulated legacy detents for compatibility.
+
+diff --git a/hw/input/meson.build b/hw/input/meson.build
+index 90a2149..8048414 100644
+--- a/hw/input/meson.build
++++ b/hw/input/meson.build
+@@ -7,6 +7,7 @@ system_ss.add(when: 'CONFIG_STELLARIS_GAMEPAD', if_true: files('stellaris_gamepa
+ 
+ system_ss.add(when: 'CONFIG_VIRTIO_INPUT', if_true: files('virtio-input.c'))
+ system_ss.add(when: 'CONFIG_VIRTIO_INPUT', if_true: files('virtio-input-hid.c'))
++system_ss.add(when: 'CONFIG_VIRTIO_INPUT', if_true: files('virtio-input-scroll.c'))
+ system_ss.add(when: 'CONFIG_VIRTIO_INPUT_HOST', if_true: files('virtio-input-host.c'))
+ 
+ system_ss.add(when: 'CONFIG_LASIPS2', if_true: files('lasips2.c'))
+diff --git a/hw/input/virtio-input-scroll.c b/hw/input/virtio-input-scroll.c
+new file mode 100644
+index 0000000..78cb6e5
+--- /dev/null
++++ b/hw/input/virtio-input-scroll.c
+@@ -0,0 +1,413 @@
++/*
++ * Dedicated virtio input devices for semantic Cocoa scrolling.
++ *
++ * Copyright (c) 2026 Try Omarchy contributors
++ * SPDX-License-Identifier: GPL-2.0-or-later
++ */
++#include "qemu/osdep.h"
++#include <math.h>
++#include "qemu/module.h"
++#include "qemu/timer.h"
++#include "hw/virtio/virtio-input.h"
++#include "ui/scroll-gesture.h"
++#include "standard-headers/linux/input.h"
++
++#define SCROLL_TOUCHPAD_CENTER 16384.0
++#define SCROLL_TOUCHPAD_RADIUS 3072
++#define SCROLL_TOUCHPAD_EDGE 4096
++#define SCROLL_TOUCHPAD_UNITS_PER_POINT 16.0
++#define SCROLL_TOUCHPAD_IDLE_NS (90 * SCALE_MS)
++
++#define HIRES_WHEEL_UNITS_PER_POINT 3.0
++#define HIRES_WHEEL_UNITS_PER_DETENT 120
++
++static void scroll_send(VirtIOInput *vinput, int type, int code, int value)
++{
++    virtio_input_event event = {
++        .type = cpu_to_le16(type),
++        .code = cpu_to_le16(code),
++        .value = cpu_to_le32(value),
++    };
++
++    virtio_input_send(vinput, &event);
++}
++
++static void scroll_sync(VirtIOInput *vinput)
++{
++    scroll_send(vinput, EV_SYN, SYN_REPORT, 0);
++}
++
++static void scroll_add_bitmap(VirtIOInput *vinput, uint8_t select,
++                              uint8_t subsel, const unsigned short *bits,
++                              size_t count)
++{
++    virtio_input_config config = {
++        .select = select,
++        .subsel = subsel,
++    };
++
++    for (size_t i = 0; i < count; i++) {
++        unsigned bit = bits[i];
++
++        config.u.bitmap[bit / 8] |= 1 << (bit % 8);
++        config.size = MAX(config.size, bit / 8 + 1);
++    }
++    virtio_input_add_config(vinput, &config);
++}
++
++static void scroll_add_ids(VirtIOInput *vinput, const char *name,
++                           uint16_t product)
++{
++    virtio_input_config config = {
++        .select = VIRTIO_INPUT_CFG_ID_NAME,
++    };
++
++    config.size = snprintf(config.u.string, sizeof(config.u.string),
++                           "%s", name);
++    virtio_input_add_config(vinput, &config);
++
++    memset(&config, 0, sizeof(config));
++    config.select = VIRTIO_INPUT_CFG_ID_DEVIDS;
++    config.size = sizeof(struct virtio_input_devids);
++    config.u.ids.bustype = const_le16(BUS_VIRTUAL);
++    config.u.ids.vendor = const_le16(0x0627);
++    config.u.ids.product = const_le16(product);
++    config.u.ids.version = const_le16(1);
++    virtio_input_add_config(vinput, &config);
++}
++
++static void scroll_touchpad_emit_positions(VirtIOScrollTouchpad *touchpad)
++{
++    VirtIOInput *vinput = VIRTIO_INPUT(touchpad);
++    int center_x = lround(touchpad->x);
++    int y = lround(touchpad->y);
++
++    for (int slot = 0; slot < 2; slot++) {
++        int x = center_x + (slot == 0 ? -SCROLL_TOUCHPAD_RADIUS :
++                                         SCROLL_TOUCHPAD_RADIUS);
++
++        scroll_send(vinput, EV_ABS, ABS_MT_SLOT, slot);
++        scroll_send(vinput, EV_ABS, ABS_MT_POSITION_X, x);
++        scroll_send(vinput, EV_ABS, ABS_MT_POSITION_Y, y);
++    }
++}
++
++static void scroll_touchpad_begin(VirtIOScrollTouchpad *touchpad)
++{
++    VirtIOInput *vinput = VIRTIO_INPUT(touchpad);
++
++    if (touchpad->touching) {
++        return;
++    }
++    touchpad->x = SCROLL_TOUCHPAD_CENTER;
++    touchpad->y = SCROLL_TOUCHPAD_CENTER;
++    touchpad->touching = true;
++
++    scroll_send(vinput, EV_KEY, BTN_TOUCH, 1);
++    scroll_send(vinput, EV_KEY, BTN_TOOL_DOUBLETAP, 1);
++    for (int slot = 0; slot < 2; slot++) {
++        scroll_send(vinput, EV_ABS, ABS_MT_SLOT, slot);
++        scroll_send(vinput, EV_ABS, ABS_MT_TRACKING_ID, slot + 1);
++    }
++    scroll_touchpad_emit_positions(touchpad);
++    scroll_sync(vinput);
++}
++
++static void scroll_touchpad_end(VirtIOScrollTouchpad *touchpad)
++{
++    VirtIOInput *vinput = VIRTIO_INPUT(touchpad);
++
++    timer_del(touchpad->idle_timer);
++    if (!touchpad->touching) {
++        return;
++    }
++    for (int slot = 0; slot < 2; slot++) {
++        scroll_send(vinput, EV_ABS, ABS_MT_SLOT, slot);
++        scroll_send(vinput, EV_ABS, ABS_MT_TRACKING_ID, -1);
++    }
++    scroll_send(vinput, EV_KEY, BTN_TOUCH, 0);
++    scroll_send(vinput, EV_KEY, BTN_TOOL_DOUBLETAP, 0);
++    scroll_sync(vinput);
++    touchpad->touching = false;
++}
++
++static void scroll_touchpad_idle(void *opaque)
++{
++    scroll_touchpad_end(opaque);
++}
++
++static void scroll_touchpad_rearm_idle(VirtIOScrollTouchpad *touchpad)
++{
++    timer_mod_ns(touchpad->idle_timer,
++                 qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
++                 SCROLL_TOUCHPAD_IDLE_NS);
++}
++
++static void scroll_touchpad_sample(VirtIOScrollTouchpad *touchpad,
++                                   const ScrollGestureSample *sample)
++{
++    double dx;
++    double dy;
++
++    if (!sample->precise || !isfinite(sample->dx) || !isfinite(sample->dy)) {
++        return;
++    }
++
++    /*
++     * The guest touchpad stack owns kinetic scrolling; host momentum is not
++     * replayed as a second physical gesture.
++     */
++    if (sample->momentum_phase != SCROLL_GESTURE_PHASE_NONE) {
++        scroll_touchpad_end(touchpad);
++        return;
++    }
++    if (sample->phase == SCROLL_GESTURE_PHASE_CANCEL ||
++        sample->phase == SCROLL_GESTURE_PHASE_END) {
++        scroll_touchpad_end(touchpad);
++        return;
++    }
++    if (sample->phase == SCROLL_GESTURE_PHASE_BEGIN) {
++        scroll_touchpad_end(touchpad);
++        scroll_touchpad_begin(touchpad);
++    }
++    if (sample->dx == 0.0 && sample->dy == 0.0) {
++        if (touchpad->touching) {
++            scroll_touchpad_rearm_idle(touchpad);
++        }
++        return;
++    }
++
++    scroll_touchpad_begin(touchpad);
++    dx = CLAMP(-sample->dx * SCROLL_TOUCHPAD_UNITS_PER_POINT,
++               -2048.0, 2048.0);
++    dy = CLAMP(-sample->dy * SCROLL_TOUCHPAD_UNITS_PER_POINT,
++               -2048.0, 2048.0);
++
++    if (touchpad->x + dx < SCROLL_TOUCHPAD_EDGE + SCROLL_TOUCHPAD_RADIUS ||
++        touchpad->x + dx > 32767 - SCROLL_TOUCHPAD_EDGE -
++                           SCROLL_TOUCHPAD_RADIUS ||
++        touchpad->y + dy < SCROLL_TOUCHPAD_EDGE ||
++        touchpad->y + dy > 32767 - SCROLL_TOUCHPAD_EDGE) {
++        scroll_touchpad_end(touchpad);
++        scroll_touchpad_begin(touchpad);
++    }
++    touchpad->x += dx;
++    touchpad->y += dy;
++    scroll_touchpad_emit_positions(touchpad);
++    scroll_sync(VIRTIO_INPUT(touchpad));
++    scroll_touchpad_rearm_idle(touchpad);
++}
++
++static void scroll_touchpad_reset(VirtIOScrollTouchpad *touchpad)
++{
++    scroll_touchpad_end(touchpad);
++    touchpad->x = SCROLL_TOUCHPAD_CENTER;
++    touchpad->y = SCROLL_TOUCHPAD_CENTER;
++}
++
++static void scroll_touchpad_change_active(VirtIOInput *vinput)
++{
++    if (!vinput->active) {
++        scroll_touchpad_reset(VIRTIO_SCROLL_TOUCHPAD(vinput));
++    }
++}
++
++static void scroll_touchpad_init(Object *obj)
++{
++    VirtIOScrollTouchpad *touchpad = VIRTIO_SCROLL_TOUCHPAD(obj);
++    VirtIOInput *vinput = VIRTIO_INPUT(obj);
++    const unsigned short keys[] = {
++        BTN_TOUCH, BTN_TOOL_FINGER, BTN_TOOL_DOUBLETAP,
++    };
++    const unsigned short axes[] = {
++        ABS_X, ABS_Y, ABS_MT_SLOT, ABS_MT_TRACKING_ID,
++        ABS_MT_POSITION_X, ABS_MT_POSITION_Y,
++    };
++    const unsigned short props[] = { INPUT_PROP_POINTER };
++    const unsigned short position_axes[] = {
++        ABS_X, ABS_Y, ABS_MT_POSITION_X, ABS_MT_POSITION_Y,
++    };
++    virtio_input_config empty = { 0 };
++    virtio_input_config config = { 0 };
++
++    virtio_input_init_config(vinput, &empty);
++    scroll_add_ids(vinput, "QEMU Virtio Scroll Touchpad", 0x0005);
++    scroll_add_bitmap(vinput, VIRTIO_INPUT_CFG_EV_BITS, EV_KEY,
++                      keys, ARRAY_SIZE(keys));
++    scroll_add_bitmap(vinput, VIRTIO_INPUT_CFG_EV_BITS, EV_ABS,
++                      axes, ARRAY_SIZE(axes));
++    scroll_add_bitmap(vinput, VIRTIO_INPUT_CFG_PROP_BITS, 0,
++                      props, ARRAY_SIZE(props));
++
++    config.select = VIRTIO_INPUT_CFG_ABS_INFO;
++    config.size = sizeof(virtio_input_absinfo);
++    config.subsel = ABS_MT_SLOT;
++    config.u.abs.max = const_le32(1);
++    virtio_input_add_config(vinput, &config);
++    config.subsel = ABS_MT_TRACKING_ID;
++    config.u.abs.max = const_le32(65535);
++    virtio_input_add_config(vinput, &config);
++    config.u.abs.max = const_le32(32767);
++    config.u.abs.res = const_le32(327);
++    for (size_t i = 0; i < ARRAY_SIZE(position_axes); i++) {
++        config.subsel = position_axes[i];
++        virtio_input_add_config(vinput, &config);
++    }
++
++    touchpad->x = SCROLL_TOUCHPAD_CENTER;
++    touchpad->y = SCROLL_TOUCHPAD_CENTER;
++    touchpad->idle_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
++                                         scroll_touchpad_idle, touchpad);
++}
++
++static void scroll_touchpad_finalize(Object *obj)
++{
++    VirtIOScrollTouchpad *touchpad = VIRTIO_SCROLL_TOUCHPAD(obj);
++
++    timer_free(touchpad->idle_timer);
++}
++
++static void scroll_touchpad_class_init(ObjectClass *klass, const void *data)
++{
++    VirtIOInputClass *vinput_class = VIRTIO_INPUT_CLASS(klass);
++
++    vinput_class->change_active = scroll_touchpad_change_active;
++}
++
++static int hires_wheel_value(double points, double *fraction)
++{
++    double units = points * HIRES_WHEEL_UNITS_PER_POINT + *fraction;
++    int value = trunc(units);
++
++    *fraction = units - value;
++    return value;
++}
++
++static void hires_wheel_axis(VirtIOHiResWheel *wheel, double points,
++                             int hires_code, int legacy_code,
++                             double *fraction, int *legacy_accum)
++{
++    VirtIOInput *vinput = VIRTIO_INPUT(wheel);
++    int value = hires_wheel_value(points, fraction);
++
++    if (!value) {
++        return;
++    }
++    scroll_send(vinput, EV_REL, hires_code, value);
++    *legacy_accum += value;
++    while (abs(*legacy_accum) >= HIRES_WHEEL_UNITS_PER_DETENT) {
++        int step = *legacy_accum > 0 ? 1 : -1;
++
++        scroll_send(vinput, EV_REL, legacy_code, step);
++        *legacy_accum -= step * HIRES_WHEEL_UNITS_PER_DETENT;
++    }
++}
++
++static void hires_wheel_sample(VirtIOHiResWheel *wheel,
++                               const ScrollGestureSample *sample)
++{
++    VirtIOInput *vinput = VIRTIO_INPUT(wheel);
++    uint32_t before = vinput->qindex;
++
++    if (!sample->precise || !isfinite(sample->dx) || !isfinite(sample->dy)) {
++        return;
++    }
++    if (sample->phase == SCROLL_GESTURE_PHASE_CANCEL) {
++        wheel->vertical_fraction = 0;
++        wheel->horizontal_fraction = 0;
++        wheel->vertical_legacy = 0;
++        wheel->horizontal_legacy = 0;
++        return;
++    }
++    hires_wheel_axis(wheel, sample->dy, REL_WHEEL_HI_RES, REL_WHEEL,
++                     &wheel->vertical_fraction, &wheel->vertical_legacy);
++    hires_wheel_axis(wheel, sample->dx, REL_HWHEEL_HI_RES, REL_HWHEEL,
++                     &wheel->horizontal_fraction, &wheel->horizontal_legacy);
++    if (vinput->qindex != before) {
++        scroll_sync(vinput);
++    }
++}
++
++static void hires_wheel_reset(VirtIOHiResWheel *wheel)
++{
++    wheel->vertical_fraction = 0;
++    wheel->horizontal_fraction = 0;
++    wheel->vertical_legacy = 0;
++    wheel->horizontal_legacy = 0;
++}
++
++static void hires_wheel_change_active(VirtIOInput *vinput)
++{
++    if (!vinput->active) {
++        hires_wheel_reset(VIRTIO_HIRES_WHEEL(vinput));
++    }
++}
++
++static void hires_wheel_init(Object *obj)
++{
++    VirtIOInput *vinput = VIRTIO_INPUT(obj);
++    const unsigned short axes[] = {
++        REL_WHEEL, REL_HWHEEL, REL_WHEEL_HI_RES, REL_HWHEEL_HI_RES,
++    };
++    virtio_input_config empty = { 0 };
++
++    virtio_input_init_config(vinput, &empty);
++    scroll_add_ids(vinput, "QEMU Virtio High Resolution Wheel", 0x0006);
++    scroll_add_bitmap(vinput, VIRTIO_INPUT_CFG_EV_BITS, EV_REL,
++                      axes, ARRAY_SIZE(axes));
++}
++
++static void hires_wheel_class_init(ObjectClass *klass, const void *data)
++{
++    VirtIOInputClass *vinput_class = VIRTIO_INPUT_CLASS(klass);
++
++    vinput_class->change_active = hires_wheel_change_active;
++}
++
++void virtio_scroll_touchpad_send(VirtIOScrollTouchpad *touchpad,
++                                 const ScrollGestureSample *sample)
++{
++    scroll_touchpad_sample(touchpad, sample);
++}
++
++void virtio_scroll_touchpad_reset(VirtIOScrollTouchpad *touchpad,
++                                  bool running)
++{
++    scroll_touchpad_reset(touchpad);
++}
++
++void virtio_hires_wheel_send(VirtIOHiResWheel *wheel,
++                             const ScrollGestureSample *sample)
++{
++    hires_wheel_sample(wheel, sample);
++}
++
++void virtio_hires_wheel_reset(VirtIOHiResWheel *wheel, bool running)
++{
++    hires_wheel_reset(wheel);
++}
++
++static const TypeInfo scroll_touchpad_info = {
++    .name = TYPE_VIRTIO_SCROLL_TOUCHPAD,
++    .parent = TYPE_VIRTIO_INPUT,
++    .instance_size = sizeof(VirtIOScrollTouchpad),
++    .instance_init = scroll_touchpad_init,
++    .instance_finalize = scroll_touchpad_finalize,
++    .class_init = scroll_touchpad_class_init,
++};
++
++static const TypeInfo hires_wheel_info = {
++    .name = TYPE_VIRTIO_HIRES_WHEEL,
++    .parent = TYPE_VIRTIO_INPUT,
++    .instance_size = sizeof(VirtIOHiResWheel),
++    .instance_init = hires_wheel_init,
++    .class_init = hires_wheel_class_init,
++};
++
++static void virtio_scroll_register_types(void)
++{
++    type_register_static(&scroll_touchpad_info);
++    type_register_static(&hires_wheel_info);
++}
++
++type_init(virtio_scroll_register_types)
+diff --git a/hw/virtio/virtio-input-pci.c b/hw/virtio/virtio-input-pci.c
+index 07f0364..beed527 100644
+--- a/hw/virtio/virtio-input-pci.c
++++ b/hw/virtio/virtio-input-pci.c
+@@ -13,6 +13,7 @@
+ #include "hw/virtio/virtio-input.h"
+ #include "qemu/module.h"
+ #include "qom/object.h"
++#include "ui/scroll-gesture.h"
+ 
+ 
+ /*
+@@ -31,13 +32,28 @@ struct VirtIOInputPCI {
+ #define TYPE_VIRTIO_TABLET_PCI     "virtio-tablet-pci"
+ #define TYPE_VIRTIO_MULTITOUCH_PCI "virtio-multitouch-pci"
+ #define TYPE_VIRTIO_PINCH_PCI     "virtio-pinch-pci"
++#define TYPE_VIRTIO_SCROLL_TOUCHPAD_PCI "virtio-scroll-touchpad-pci"
++#define TYPE_VIRTIO_HIRES_WHEEL_PCI     "virtio-hires-wheel-pci"
+ OBJECT_DECLARE_SIMPLE_TYPE(VirtIOInputHIDPCI, VIRTIO_INPUT_HID_PCI)
++OBJECT_DECLARE_SIMPLE_TYPE(VirtIOScrollTouchpadPCI,
++                           VIRTIO_SCROLL_TOUCHPAD_PCI)
++OBJECT_DECLARE_SIMPLE_TYPE(VirtIOHiResWheelPCI, VIRTIO_HIRES_WHEEL_PCI)
+ 
+ struct VirtIOInputHIDPCI {
+     VirtIOPCIProxy parent_obj;
+     VirtIOInputHID vdev;
+ };
+ 
++struct VirtIOScrollTouchpadPCI {
++    VirtIOPCIProxy parent_obj;
++    VirtIOScrollTouchpad vdev;
++};
++
++struct VirtIOHiResWheelPCI {
++    VirtIOPCIProxy parent_obj;
++    VirtIOHiResWheel vdev;
++};
++
+ static const Property virtio_input_pci_properties[] = {
+     DEFINE_PROP_UINT32("vectors", VirtIOPCIProxy, nvectors, 2),
+ };
+@@ -120,6 +136,84 @@ static void virtio_pinch_initfn(Object *obj)
+                                 TYPE_VIRTIO_PINCH);
+ }
+ 
++static void virtio_scroll_touchpad_initfn(Object *obj)
++{
++    VirtIOScrollTouchpadPCI *dev = VIRTIO_SCROLL_TOUCHPAD_PCI(obj);
++
++    virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
++                                TYPE_VIRTIO_SCROLL_TOUCHPAD);
++}
++
++static void virtio_hires_wheel_initfn(Object *obj)
++{
++    VirtIOHiResWheelPCI *dev = VIRTIO_HIRES_WHEEL_PCI(obj);
++
++    virtio_instance_init_common(obj, &dev->vdev, sizeof(dev->vdev),
++                                TYPE_VIRTIO_HIRES_WHEEL);
++}
++
++static void virtio_scroll_touchpad_sink_send(
++    ScrollGestureSink *sink, const ScrollGestureSample *sample)
++{
++    VirtIOScrollTouchpadPCI *dev =
++        VIRTIO_SCROLL_TOUCHPAD_PCI(OBJECT(sink));
++
++    virtio_scroll_touchpad_send(&dev->vdev, sample);
++}
++
++static void virtio_scroll_touchpad_sink_reset(ScrollGestureSink *sink,
++                                               bool running)
++{
++    VirtIOScrollTouchpadPCI *dev =
++        VIRTIO_SCROLL_TOUCHPAD_PCI(OBJECT(sink));
++
++    virtio_scroll_touchpad_reset(&dev->vdev, running);
++}
++
++static void virtio_scroll_touchpad_sink_init(ObjectClass *klass,
++                                              const void *data)
++{
++    ScrollGestureSinkClass *sink = SCROLL_GESTURE_SINK_CLASS(klass);
++
++    sink->send = virtio_scroll_touchpad_sink_send;
++    sink->reset = virtio_scroll_touchpad_sink_reset;
++}
++
++static void virtio_hires_wheel_sink_send(
++    ScrollGestureSink *sink, const ScrollGestureSample *sample)
++{
++    VirtIOHiResWheelPCI *dev = VIRTIO_HIRES_WHEEL_PCI(OBJECT(sink));
++
++    virtio_hires_wheel_send(&dev->vdev, sample);
++}
++
++static void virtio_hires_wheel_sink_reset(ScrollGestureSink *sink,
++                                           bool running)
++{
++    VirtIOHiResWheelPCI *dev = VIRTIO_HIRES_WHEEL_PCI(OBJECT(sink));
++
++    virtio_hires_wheel_reset(&dev->vdev, running);
++}
++
++static void virtio_hires_wheel_sink_init(ObjectClass *klass,
++                                          const void *data)
++{
++    ScrollGestureSinkClass *sink = SCROLL_GESTURE_SINK_CLASS(klass);
++
++    sink->send = virtio_hires_wheel_sink_send;
++    sink->reset = virtio_hires_wheel_sink_reset;
++}
++
++static const InterfaceInfo virtio_scroll_touchpad_interfaces[] = {
++    { TYPE_SCROLL_GESTURE_SINK },
++    { }
++};
++
++static const InterfaceInfo virtio_hires_wheel_interfaces[] = {
++    { TYPE_SCROLL_GESTURE_SINK },
++    { }
++};
++
+ static const TypeInfo virtio_input_pci_info = {
+     .name          = TYPE_VIRTIO_INPUT_PCI,
+     .parent        = TYPE_VIRTIO_PCI,
+@@ -172,6 +266,24 @@ static const VirtioPCIDeviceTypeInfo virtio_pinch_pci_info = {
+     .instance_init = virtio_pinch_initfn,
+ };
+ 
++static const VirtioPCIDeviceTypeInfo virtio_scroll_touchpad_pci_info = {
++    .generic_name = TYPE_VIRTIO_SCROLL_TOUCHPAD_PCI,
++    .parent = TYPE_VIRTIO_INPUT_PCI,
++    .instance_size = sizeof(VirtIOScrollTouchpadPCI),
++    .instance_init = virtio_scroll_touchpad_initfn,
++    .class_init = virtio_scroll_touchpad_sink_init,
++    .interfaces = virtio_scroll_touchpad_interfaces,
++};
++
++static const VirtioPCIDeviceTypeInfo virtio_hires_wheel_pci_info = {
++    .generic_name = TYPE_VIRTIO_HIRES_WHEEL_PCI,
++    .parent = TYPE_VIRTIO_INPUT_PCI,
++    .instance_size = sizeof(VirtIOHiResWheelPCI),
++    .instance_init = virtio_hires_wheel_initfn,
++    .class_init = virtio_hires_wheel_sink_init,
++    .interfaces = virtio_hires_wheel_interfaces,
++};
++
+ static void virtio_pci_input_register(void)
+ {
+     /* Base types: */
+@@ -184,6 +296,8 @@ static void virtio_pci_input_register(void)
+     virtio_pci_types_register(&virtio_tablet_pci_info);
+     virtio_pci_types_register(&virtio_multitouch_pci_info);
+     virtio_pci_types_register(&virtio_pinch_pci_info);
++    virtio_pci_types_register(&virtio_scroll_touchpad_pci_info);
++    virtio_pci_types_register(&virtio_hires_wheel_pci_info);
+ }
+ 
+ type_init(virtio_pci_input_register)
+diff --git a/include/hw/virtio/virtio-input.h b/include/hw/virtio/virtio-input.h
+index a382d9f..22c3484 100644
+--- a/include/hw/virtio/virtio-input.h
++++ b/include/hw/virtio/virtio-input.h
+@@ -13,6 +13,8 @@
+ #include "standard-headers/linux/virtio_input.h"
+ #include "qom/object.h"
+ 
++typedef struct ScrollGestureSample ScrollGestureSample;
++
+ typedef struct virtio_input_absinfo virtio_input_absinfo;
+ typedef struct virtio_input_config virtio_input_config;
+ typedef struct virtio_input_event virtio_input_event;
+@@ -32,11 +34,16 @@ OBJECT_DECLARE_TYPE(VirtIOInput, VirtIOInputClass,
+ #define TYPE_VIRTIO_TABLET     "virtio-tablet-device"
+ #define TYPE_VIRTIO_MULTITOUCH "virtio-multitouch-device"
+ #define TYPE_VIRTIO_PINCH      "virtio-pinch-device"
++#define TYPE_VIRTIO_SCROLL_TOUCHPAD "virtio-scroll-touchpad-device"
++#define TYPE_VIRTIO_HIRES_WHEEL     "virtio-hires-wheel-device"
+ 
+ OBJECT_DECLARE_SIMPLE_TYPE(VirtIOInputHID, VIRTIO_INPUT_HID)
+ #define VIRTIO_INPUT_HID_GET_PARENT_CLASS(obj) \
+         OBJECT_GET_PARENT_CLASS(obj, TYPE_VIRTIO_INPUT_HID)
+ 
++OBJECT_DECLARE_SIMPLE_TYPE(VirtIOScrollTouchpad, VIRTIO_SCROLL_TOUCHPAD)
++OBJECT_DECLARE_SIMPLE_TYPE(VirtIOHiResWheel, VIRTIO_HIRES_WHEEL)
++
+ #define TYPE_VIRTIO_INPUT_HOST   "virtio-input-host-device"
+ OBJECT_DECLARE_SIMPLE_TYPE(VirtIOInputHost, VIRTIO_INPUT_HOST)
+ #define VIRTIO_INPUT_HOST_GET_PARENT_CLASS(obj) \
+@@ -92,6 +99,22 @@ struct VirtIOInputHID {
+     int                               ledstate;
+ };
+ 
++struct VirtIOScrollTouchpad {
++    VirtIOInput parent_obj;
++    QEMUTimer *idle_timer;
++    double x;
++    double y;
++    bool touching;
++};
++
++struct VirtIOHiResWheel {
++    VirtIOInput parent_obj;
++    double vertical_fraction;
++    double horizontal_fraction;
++    int vertical_legacy;
++    int horizontal_legacy;
++};
++
+ struct VirtIOInputHost {
+     VirtIOInput                       parent_obj;
+     char                              *evdev;
+@@ -112,5 +135,12 @@ void virtio_input_add_config(VirtIOInput *vinput,
+                              virtio_input_config *config);
+ void virtio_input_idstr_config(VirtIOInput *vinput,
+                                uint8_t select, const char *string);
++void virtio_scroll_touchpad_send(VirtIOScrollTouchpad *touchpad,
++                                 const ScrollGestureSample *sample);
++void virtio_scroll_touchpad_reset(VirtIOScrollTouchpad *touchpad,
++                                  bool running);
++void virtio_hires_wheel_send(VirtIOHiResWheel *wheel,
++                             const ScrollGestureSample *sample);
++void virtio_hires_wheel_reset(VirtIOHiResWheel *wheel, bool running);
+ 
+ #endif /* QEMU_VIRTIO_INPUT_H */

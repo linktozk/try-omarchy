@@ -88,6 +88,7 @@ chmod 0755 \
   "$root/usr/local/bin/omarchy-native-cursor-restore" \
   "$root/usr/local/bin/omarchy-native-display-sync" \
   "$root/usr/local/bin/omarchy-native-mac-share" \
+  "$root/usr/local/bin/try-omarchy-scroll-check" \
   "$root/usr/local/bin/try-omarchy-touch-id" \
   "$root/usr/local/bin/try-omarchy-touch-id-test" \
   "$root/usr/local/lib/try-omarchy/native-authentication-broker" \

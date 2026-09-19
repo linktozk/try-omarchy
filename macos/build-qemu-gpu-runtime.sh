@@ -50,6 +50,9 @@ immersive_patch="$native_dir/patches/qemu-cocoa-immersive-mode.patch"
 full_grab_patch="$native_dir/patches/qemu-cocoa-full-grab-focus.patch"
 pause_ownership_patch="$native_dir/patches/qemu-cocoa-pause-ownership.patch"
 pinch_patch="$native_dir/patches/qemu-cocoa-pinch-zoom.patch"
+scroll_sink_patch="$native_dir/patches/qemu-scroll-gesture-sink.patch"
+scroll_devices_patch="$native_dir/patches/qemu-virtio-scroll-devices.patch"
+scroll_cocoa_patch="$native_dir/patches/qemu-cocoa-scroll-routing.patch"
 audio_device_patch="$native_dir/patches/qemu-sdl-audio-device-selection.patch"
 shared_folder_patch="$native_dir/patches/qemu-9p-guest-owner.patch"
 strchrnul_patch="$native_dir/patches/qemu-darwin-strchrnul-compat.patch"
@@ -72,6 +75,9 @@ immersive_patch_sha256=2462463932f7db0d659f754f7f9c182884564dbcd7d4b8e523f1b57f0
 full_grab_patch_sha256=d94aaa7b8b8b97eb25a5ace2b3a1268985e1b16e4e6201847b926b8ee709dbfb
 pause_ownership_patch_sha256=1a5729b36eb3e437395d41883a10c3c652df71d289d5df84d95aebd49c78a8f0
 pinch_patch_sha256=37acb8895dddd35fc66812d0c49ec5fc697f9127e9e12ed2e60d17999bf32aee
+scroll_sink_patch_sha256=e3ca00f9cae94afb96b875bc9deadc17207a727a3ad75919edb80c6d2391efe7
+scroll_devices_patch_sha256=83cc2e485e51454267426bbc683d0c994aaaeb3a1fcba936ecbef386043a4541
+scroll_cocoa_patch_sha256=96bbace4028fa8dad2b8d30d5043f85314cc6436723d35b2ed48caf3ef06715a
 audio_device_patch_sha256=03aca71c26163c337338cc3b2013c35430690fc0e8b66c5ce92a42f59a9b3334
 shared_folder_patch_sha256=41247692501655393ae3a40f56915472ab29b6e89c5173e33db1f62cca56632f
 strchrnul_patch_sha256=ec1048dd0e8ebe53bf7e8a3bca9bf2f5f4336cd607d4cd077437470e9a32094a
@@ -169,6 +175,12 @@ macos_major=$(sw_vers -productVersion | awk -F. '{ print $1 }')
   die "missing Cocoa pause-ownership patch: $pause_ownership_patch"
 [[ -f $pinch_patch && ! -L $pinch_patch ]] || \
   die "missing Cocoa pinch-zoom patch: $pinch_patch"
+[[ -f $scroll_sink_patch && ! -L $scroll_sink_patch ]] || \
+  die "missing scroll-gesture sink patch: $scroll_sink_patch"
+[[ -f $scroll_devices_patch && ! -L $scroll_devices_patch ]] || \
+  die "missing virtio scroll-device patch: $scroll_devices_patch"
+[[ -f $scroll_cocoa_patch && ! -L $scroll_cocoa_patch ]] || \
+  die "missing Cocoa scroll-routing patch: $scroll_cocoa_patch"
 [[ -f $audio_device_patch && ! -L $audio_device_patch ]] || \
   die "missing SDL audio-device patch: $audio_device_patch"
 [[ -f $texture_patch && ! -L $texture_patch ]] || \
@@ -367,6 +379,12 @@ verify_file_sha "Try Omarchy Cocoa pause-ownership patch" \
   "$pause_ownership_patch" "$pause_ownership_patch_sha256"
 verify_file_sha "Try Omarchy Cocoa pinch-zoom patch" \
   "$pinch_patch" "$pinch_patch_sha256"
+verify_file_sha "Try Omarchy scroll-gesture sink patch" \
+  "$scroll_sink_patch" "$scroll_sink_patch_sha256"
+verify_file_sha "Try Omarchy virtio scroll-device patch" \
+  "$scroll_devices_patch" "$scroll_devices_patch_sha256"
+verify_file_sha "Try Omarchy Cocoa scroll-routing patch" \
+  "$scroll_cocoa_patch" "$scroll_cocoa_patch_sha256"
 verify_file_sha "Try Omarchy SDL audio-device patch" \
   "$audio_device_patch" "$audio_device_patch_sha256"
 verify_file_sha "Try Omarchy 9p shared-folder patch" \
@@ -386,6 +404,9 @@ patch -d "$source_dir" -p1 -f -i "$audio_device_patch"
 patch -d "$source_dir" -p1 -f -i "$shared_folder_patch"
 patch -d "$source_dir" -p1 -f -i "$strchrnul_patch"
 patch -d "$source_dir" -p1 -f -i "$pinch_patch"
+patch -d "$source_dir" -p1 -f -i "$scroll_sink_patch"
+patch -d "$source_dir" -p1 -f -i "$scroll_devices_patch"
+patch -d "$source_dir" -p1 -f -i "$scroll_cocoa_patch"
 
 virgl_root="$dependency_root/virglrenderer/$virgl_version"
 angle_root="$dependency_root/angle/$angle_version"
