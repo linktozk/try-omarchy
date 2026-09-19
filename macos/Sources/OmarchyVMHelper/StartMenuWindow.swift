@@ -170,6 +170,8 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
     private var networkEditor: NetworkEditor?
     private let immersiveMode: () -> Bool
     private let setImmersiveMode: (Bool) -> Void
+    private let scrollMode: () -> ScrollInputMode
+    private let setScrollMode: (ScrollInputMode) -> Void
     private let launch: () -> Void
     private let canResetStorage: Bool
     private let storageLocation: () -> String?
@@ -257,6 +259,8 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         saveNetworkPreferences: @escaping (VMNetworkPreferences) -> String? = { _ in nil },
         immersiveMode: @escaping () -> Bool = { true },
         setImmersiveMode: @escaping (Bool) -> Void = { _ in },
+        scrollMode: @escaping () -> ScrollInputMode = { .automatic },
+        setScrollMode: @escaping (ScrollInputMode) -> Void = { _ in },
         launch: @escaping () -> Void
     ) {
         self.accessibilityStatus = accessibilityStatus
@@ -286,6 +290,8 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         self.saveNetworkPreferences = saveNetworkPreferences
         self.immersiveMode = immersiveMode
         self.setImmersiveMode = setImmersiveMode
+        self.scrollMode = scrollMode
+        self.setScrollMode = setScrollMode
         self.launch = launch
 
         window = NSWindow(
@@ -570,6 +576,7 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
             minimumHeight: 90
         )
         let immersiveRow = immersiveSettingRow(isEnabled: immersiveMode())
+        let scrollRow = scrollSettingRow(mode: scrollMode())
         let selectedResources = resources()
         let resourceRow = permissionRow(
             symbolName: "cpu",
@@ -637,7 +644,7 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         if let storageRow {
             integrationRowViews.append(storageRow)
         }
-        integrationRowViews.append(contentsOf: [resourceRow, networkingRow, portForwardingRow, immersiveRow])
+        integrationRowViews.append(contentsOf: [resourceRow, networkingRow, portForwardingRow, scrollRow, immersiveRow])
 
         var permissionRowsAndSeparators: [NSView] = []
         for (index, row) in permissionRowViews.enumerated() {
@@ -1142,6 +1149,70 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
         return row
     }
 
+    private func scrollSettingRow(mode: ScrollInputMode) -> NSView {
+        let symbol = NSImageView()
+        symbol.image = NSImage(
+            systemSymbolName: "computermouse",
+            accessibilityDescription: nil
+        )
+        symbol.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 19, weight: .medium)
+        symbol.contentTintColor = OmarchyStartMenuTheme.accent
+        symbol.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            symbol.widthAnchor.constraint(equalToConstant: 26),
+            symbol.heightAnchor.constraint(equalToConstant: 26),
+        ])
+
+        let title = NSTextField(labelWithString: "Scrolling")
+        title.font = .monospacedSystemFont(ofSize: 13, weight: .bold)
+        title.textColor = OmarchyStartMenuTheme.foreground
+
+        let detail = NSTextField(wrappingLabelWithString: mode.detail)
+        detail.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        detail.textColor = OmarchyStartMenuTheme.muted
+        detail.maximumNumberOfLines = 2
+
+        let labels = NSStackView(views: [title, detail])
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 3
+        labels.translatesAutoresizingMaskIntoConstraints = false
+
+        let selector = NSPopUpButton()
+        for choice in ScrollInputMode.allCases {
+            selector.addItem(withTitle: choice.title)
+            selector.lastItem?.representedObject = choice.rawValue
+        }
+        selector.selectItem(withTitle: mode.title)
+        selector.target = self
+        selector.action = #selector(changeScrollMode(_:))
+        selector.isEnabled = !launchInProgress && !resetInProgress
+        selector.identifier = NSUserInterfaceItemIdentifier("scroll-mode-selector")
+        selector.setAccessibilityLabel("Scrolling device")
+        selector.translatesAutoresizingMaskIntoConstraints = false
+
+        let row = NSView()
+        row.identifier = NSUserInterfaceItemIdentifier("scroll-mode-row")
+        row.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(symbol)
+        row.addSubview(labels)
+        row.addSubview(selector)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(greaterThanOrEqualToConstant: 78),
+            symbol.leadingAnchor.constraint(equalTo: row.leadingAnchor),
+            symbol.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            labels.leadingAnchor.constraint(equalTo: symbol.trailingAnchor, constant: 12),
+            labels.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            labels.trailingAnchor.constraint(lessThanOrEqualTo: selector.leadingAnchor, constant: -12),
+            selector.trailingAnchor.constraint(equalTo: row.trailingAnchor),
+            selector.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            selector.widthAnchor.constraint(greaterThanOrEqualToConstant: 132),
+        ])
+        labels.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        labels.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        return row
+    }
+
     @objc private func beginAccessibilityRequest() {
         permissionWindowRestorer.cancel()
         requestAccessibility()
@@ -1416,6 +1487,14 @@ final class StartMenuWindow: NSObject, NSWindowDelegate {
                 .priority: NSAccessibilityPriorityLevel.medium.rawValue,
             ]
         )
+    }
+
+    @objc private func changeScrollMode(_ sender: NSPopUpButton) {
+        guard !launchInProgress, !resetInProgress,
+              let rawValue = sender.selectedItem?.representedObject as? String,
+              let mode = ScrollInputMode(rawValue: rawValue) else { return }
+        setScrollMode(mode)
+        render()
     }
 
     private func confirmReset() {

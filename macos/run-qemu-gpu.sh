@@ -19,6 +19,11 @@ boot_recovery_failed_status=81
 # QEMU 11's HVF backend requires Apple's in-hypervisor GICv3. Keep recovery
 # and normal launches on one machine definition so they cannot drift apart.
 qemu_machine='virt,accel=hvf,gic-version=3'
+scroll_mode=${OMARCHY_SCROLL_MODE:-auto}
+case $scroll_mode in
+  auto|trackpad|wheel) ;;
+  *) fail "OMARCHY_SCROLL_MODE must be auto, trackpad, or wheel" ;;
+esac
 
 boot_recovery_fail() {
   echo "run-qemu-gpu: $*" >&2
@@ -152,7 +157,9 @@ for device in \
   virtio-rng-pci \
   virtio-serial-pci \
   virtio-tablet-pci \
-  virtio-pinch-pci; do
+  virtio-pinch-pci \
+  virtio-scroll-touchpad-pci \
+  virtio-hires-wheel-pci; do
   require_qemu_device "$device"
 done
 for marker in guest_owner_uid guest_owner_gid; do
@@ -1550,10 +1557,12 @@ qemu_args=(
   # Full grab keeps every Command chord with the focused guest in either
   # presentation mode. Immersive launches Full Screen and hard-hides the Mac
   # menu bar and Dock; otherwise Cocoa opens a centered, resizable window.
-  -display "cocoa,gl=es,show-cursor=on,zoom-to-fit=on,full-screen=$cocoa_full_screen,full-grab=on,immersive=$cocoa_immersive,swap-opt-cmd=off"
+  -display "cocoa,gl=es,show-cursor=on,zoom-to-fit=on,full-screen=$cocoa_full_screen,full-grab=on,immersive=$cocoa_immersive,swap-opt-cmd=off,scroll-touchpad=omarchy-scroll-touchpad,scroll-wheel=omarchy-hires-wheel,scroll-mode=$scroll_mode"
   -device 'virtio-keyboard-pci,romfile='
   -device 'virtio-tablet-pci,romfile='
   -device 'virtio-pinch-pci,romfile='
+  -device 'virtio-scroll-touchpad-pci,id=omarchy-scroll-touchpad,romfile='
+  -device 'virtio-hires-wheel-pci,id=omarchy-hires-wheel,romfile='
   -object 'rng-random,id=omarchy-rng,filename=/dev/urandom'
   -device 'virtio-rng-pci,rng=omarchy-rng'
   -device virtio-balloon-pci
